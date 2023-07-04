@@ -1,6 +1,6 @@
 use lazy_static::lazy_static;
 use regex::Regex;
-use std::sync::RwLock;
+use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::{lsp_types::*, Server};
 use tower_lsp::{LanguageServer, LspService};
@@ -94,9 +94,9 @@ struct Backend {
 }
 
 impl Backend {
-    fn compute_diagnostics(&self) -> Vec<Diagnostic> {
+    async fn compute_diagnostics(&self) -> Vec<Diagnostic> {
         let mut diagnostics = vec![];
-        let content = self.content.read().unwrap();
+        let content = self.content.read().await;
         let mut content_lines = content.lines().peekable();
         // rule 2
         if let Some(first_line) = content_lines.next() {
@@ -167,16 +167,16 @@ impl LanguageServer for Backend {
         })
     }
     async fn did_open(&self, params: tower_lsp::lsp_types::DidOpenTextDocumentParams) {
-        *self.content.write().unwrap() = params.text_document.text;
+        *self.content.write().await = params.text_document.text;
         self.client
-            .publish_diagnostics(params.text_document.uri, self.compute_diagnostics(), None)
+            .publish_diagnostics(params.text_document.uri, self.compute_diagnostics().await, None)
             .await;
     }
 
     async fn did_change(&self, params: tower_lsp::lsp_types::DidChangeTextDocumentParams) {
-        *self.content.write().unwrap() = params.content_changes.first().unwrap().text.clone();
+        *self.content.write().await = params.content_changes.first().unwrap().text.clone();
         self.client
-            .publish_diagnostics(params.text_document.uri, self.compute_diagnostics(), None)
+            .publish_diagnostics(params.text_document.uri, self.compute_diagnostics().await, None)
             .await;
     }
 
