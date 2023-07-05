@@ -1,6 +1,7 @@
+use std::collections::HashMap;
+
 use lazy_static::lazy_static;
 use regex::Regex;
-use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::{lsp_types::*, Server};
 use tower_lsp::{LanguageServer, LspService};
@@ -24,16 +25,16 @@ fn make_return_diagnostic(line_no: u32) -> Diagnostic {
     }
 }
 
-fn make_semicolon_diagnostic(line_no: u32) -> Diagnostic {
+fn make_semicolon_diagnostic(line_no: u32, char_no: u32) -> Diagnostic {
     Diagnostic {
         range: Range {
             start: Position {
                 line: line_no,
-                character: 0,
+                character: char_no,
             },
             end: Position {
                 line: line_no,
-                character: 0,
+                character: char_no,
             },
         },
         severity: Some(DiagnosticSeverity::ERROR),
@@ -62,16 +63,16 @@ fn make_import_diagnostic() -> Diagnostic {
     }
 }
 
-fn make_link_rick_roll_diagnostic() -> Diagnostic {
+fn make_link_rick_roll_diagnostic(line_no: u32, char_pos: u32) -> Diagnostic {
     Diagnostic {
                 range: Range {
                     start: Position {
-                        line: 0,
-                        character: 0,
+                        line: line_no,
+                        character: char_pos,
                     },
                     end: Position {
-                        line: 0,
-                        character: 0,
+                        line: line_no,
+                        character: char_pos,
                     },
                 },
                 severity: Some(DiagnosticSeverity::ERROR),
@@ -79,6 +80,78 @@ fn make_link_rick_roll_diagnostic() -> Diagnostic {
                 message: "Every post linking to something must contain a second, identical-looking link to a rick-roll".to_string(),
                 ..Default::default()
             }
+}
+async fn compute_diagnostics(content: &str) -> Vec<Diagnostic> {
+    let mut diagnostics = vec![];
+    let mut content_lines = content.lines().peekable();
+    // rule 2
+    if let Some(first_line) = content_lines.next() {
+        lazy_static! {
+            static ref IMPORT_MATCH: Regex = Regex::new(r"(?i)\bimport\b").unwrap(); // case-insensitive
+        }
+        if !IMPORT_MATCH.is_match(first_line) {
+            diagnostics.push(make_import_diagnostic());
+        }
+        if content_lines.peek().is_none() {
+            // import line is last line, MUST be missing return
+            diagnostics.push(make_return_diagnostic(0))
+        }
+    }
+    let mut line_no = 1;
+    while let Some(line) = content_lines.next() {
+        if content_lines.peek().is_some() {
+            lazy_static! {
+                // either a non-space then a period then a space, OR anything then anything
+                // other than a semicolon then end of line
+                // this is a bit iffy, because it also flags e.g. numbered lists. but idk how
+                // the automod config looks, so we'll go with it.
+                static ref SENTENCE_END_MATCH: Regex = Regex::new(r"\w\.\s|[^.]+[^;]$").unwrap();
+            }
+            for found_match in SENTENCE_END_MATCH.find_iter(line) {
+                diagnostics.push(make_semicolon_diagnostic(
+                    line_no,
+                    (found_match.end() - 2) as u32,
+                ))
+            }
+        } else {
+            lazy_static! {
+                static ref RETURN_MATCH: Regex = Regex::new(r"(?i)\breturn\b").unwrap(); // case-insensitive
+            }
+            if !RETURN_MATCH.is_match(line) {
+                diagnostics.push(make_return_diagnostic(line_no))
+            }
+        }
+        line_no += 1;
+    }
+    lazy_static! {
+        // SHOULD match anything like [link text](https://url.com)
+        // Technically we should also be checking the link text is the same, but lazy atm.
+        // Maybe later
+        static ref MARKDOWN_LINK_MATCH: Regex = Regex::new(r"\[([^]]+)\]\(([^)]+)\)").unwrap();
+    }
+    let mut found_links: HashMap<String, Vec<(String, u32, u32)>> = HashMap::new();
+    for (line_no, line) in content.lines().enumerate() {
+        for capture in MARKDOWN_LINK_MATCH.captures_iter(line) {
+            let m = capture.get(0).unwrap();
+            found_links
+                .entry(capture[1].to_string())
+                .or_default()
+                .push((capture[2].to_string(), line_no as u32, m.start() as u32));
+        }
+    }
+
+    for links in found_links.values() {
+        if !links
+            .iter()
+            .any(|(link, _, _)| link == r"https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        {
+            for (_, line_no, char) in links {
+                diagnostics.push(make_link_rick_roll_diagnostic(*line_no, *char))
+            }
+        }
+    }
+
+    diagnostics
 }
 
 /// Implement the current rules for styling an r/programmerhumor comment
@@ -90,66 +163,6 @@ fn make_link_rick_roll_diagnostic() -> Diagnostic {
 ///     5. Every post linking to something must contain a second, identical-looking link to a rick-roll
 struct Backend {
     client: tower_lsp::Client,
-    content: RwLock<String>,
-}
-
-impl Backend {
-    async fn compute_diagnostics(&self) -> Vec<Diagnostic> {
-        let mut diagnostics = vec![];
-        let content = self.content.read().await;
-        let mut content_lines = content.lines().peekable();
-        // rule 2
-        if let Some(first_line) = content_lines.next() {
-            lazy_static! {
-                static ref IMPORT_MATCH: Regex = Regex::new(r"(?i)\bimport\b").unwrap(); // case-insensitive
-            }
-            if !IMPORT_MATCH.is_match(first_line) {
-                diagnostics.push(make_import_diagnostic());
-            }
-            if content_lines.peek().is_none() {
-                // import line is last line, MUST be missing return
-                diagnostics.push(make_return_diagnostic(0))
-            }
-        }
-        let mut line_no = 1;
-        while let Some(line) = content_lines.next() {
-            if content_lines.peek().is_some() {
-                lazy_static! {
-                    // either a non-space then a period then a space, OR anything then anything
-                    // other than a semicolon then end of line
-                    // this is a bit iffy, because it also flags e.g. numbered lists. but idk how
-                    // the automod config looks, so we'll go with it.
-                    static ref SENTENCE_END_MATCH: Regex = Regex::new(r"\w\.\s|.+[^;]$").unwrap();
-                }
-                if SENTENCE_END_MATCH.is_match(line) {
-                    diagnostics.push(make_semicolon_diagnostic(line_no))
-                }
-            } else {
-                lazy_static! {
-                    static ref RETURN_MATCH: Regex = Regex::new(r"(?i)\breturn\b").unwrap(); // case-insensitive
-                }
-                if !RETURN_MATCH.is_match(line) {
-                    diagnostics.push(make_return_diagnostic(line_no))
-                }
-            }
-            line_no += 1;
-        }
-        lazy_static! {
-            // SHOULD match anything like [link text](https://url.com)
-            // Technically we should also be checking the link text is the same, but lazy atm.
-            // Maybe later
-            static ref MARKDOWN_LINK_MATCH: Regex = Regex::new(r"\[[^]]+\]\(([^)]+)\)").unwrap();
-        }
-        if MARKDOWN_LINK_MATCH.is_match(&content)
-            && !MARKDOWN_LINK_MATCH
-                .captures_iter(&content)
-                .any(|captures| &captures[1] == r"https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-        {
-            diagnostics.push(make_link_rick_roll_diagnostic())
-        }
-
-        diagnostics
-    }
 }
 
 #[tower_lsp::async_trait]
@@ -167,16 +180,22 @@ impl LanguageServer for Backend {
         })
     }
     async fn did_open(&self, params: tower_lsp::lsp_types::DidOpenTextDocumentParams) {
-        *self.content.write().await = params.text_document.text;
         self.client
-            .publish_diagnostics(params.text_document.uri, self.compute_diagnostics().await, None)
+            .publish_diagnostics(
+                params.text_document.uri,
+                compute_diagnostics(&params.text_document.text).await,
+                None,
+            )
             .await;
     }
 
     async fn did_change(&self, params: tower_lsp::lsp_types::DidChangeTextDocumentParams) {
-        *self.content.write().await = params.content_changes.first().unwrap().text.clone();
         self.client
-            .publish_diagnostics(params.text_document.uri, self.compute_diagnostics().await, None)
+            .publish_diagnostics(
+                params.text_document.uri,
+                compute_diagnostics(&params.content_changes.first().unwrap().text).await,
+                None,
+            )
             .await;
     }
 
@@ -190,10 +209,7 @@ async fn main() -> Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(|client| Backend {
-        client,
-        content: String::new().into(),
-    });
+    let (service, socket) = LspService::new(|client| Backend { client });
     Server::new(stdin, stdout, socket).serve(service).await;
     Ok(())
 }
