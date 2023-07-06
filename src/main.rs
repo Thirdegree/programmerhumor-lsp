@@ -38,7 +38,7 @@ fn make_semicolon_diagnostic(line_no: u32, char_no: u32) -> Diagnostic {
             },
         },
         severity: Some(DiagnosticSeverity::ERROR),
-        code: Some(NumberOrString::Number(3)),
+        code: Some(NumberOrString::Number(4)),
         message: "For comments, every sentence must end with a semicolon".to_string(),
         ..Default::default()
     }
@@ -76,7 +76,7 @@ fn make_link_rick_roll_diagnostic(line_no: u32, char_pos: u32) -> Diagnostic {
                     },
                 },
                 severity: Some(DiagnosticSeverity::ERROR),
-                code: Some(NumberOrString::Number(4)),
+                code: Some(NumberOrString::Number(5)),
                 message: "Every post linking to something must contain a second, identical-looking link to a rick-roll".to_string(),
                 ..Default::default()
             }
@@ -98,8 +98,10 @@ async fn compute_diagnostics(content: &str) -> Vec<Diagnostic> {
         }
     }
     let mut line_no = 1;
+    let mut found_links: HashMap<String, Vec<(String, u32, u32)>> = HashMap::new();
     while let Some(line) = content_lines.next() {
         if content_lines.peek().is_some() {
+            // Rule 4
             lazy_static! {
                 // either a non-space then a period then a space, OR anything then anything
                 // other than a semicolon then end of line
@@ -114,6 +116,7 @@ async fn compute_diagnostics(content: &str) -> Vec<Diagnostic> {
                 ))
             }
         } else {
+            // Rule 3
             lazy_static! {
                 static ref RETURN_MATCH: Regex = Regex::new(r"(?i)\breturn\b").unwrap(); // case-insensitive
             }
@@ -121,23 +124,21 @@ async fn compute_diagnostics(content: &str) -> Vec<Diagnostic> {
                 diagnostics.push(make_return_diagnostic(line_no))
             }
         }
-        line_no += 1;
-    }
-    lazy_static! {
-        // SHOULD match anything like [link text](https://url.com)
-        // Technically we should also be checking the link text is the same, but lazy atm.
-        // Maybe later
-        static ref MARKDOWN_LINK_MATCH: Regex = Regex::new(r"\[([^]]+)\]\(([^)]+)\)").unwrap();
-    }
-    let mut found_links: HashMap<String, Vec<(String, u32, u32)>> = HashMap::new();
-    for (line_no, line) in content.lines().enumerate() {
+        // Rule 5
+        lazy_static! {
+            // SHOULD match anything like [link text](https://url.com)
+            // Technically we should also be checking the link text is the same, but lazy atm.
+            // Maybe later
+            static ref MARKDOWN_LINK_MATCH: Regex = Regex::new(r"\[([^]]+)\]\(([^)]+)\)").unwrap();
+        }
         for capture in MARKDOWN_LINK_MATCH.captures_iter(line) {
             let m = capture.get(0).unwrap();
             found_links
                 .entry(capture[1].to_string())
                 .or_default()
-                .push((capture[2].to_string(), line_no as u32, m.start() as u32));
+                .push((capture[2].to_string(), line_no, m.start() as u32));
         }
+        line_no += 1;
     }
 
     for links in found_links.values() {
@@ -179,7 +180,7 @@ impl LanguageServer for Backend {
             ..Default::default()
         })
     }
-    async fn did_open(&self, params: tower_lsp::lsp_types::DidOpenTextDocumentParams) {
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
         self.client
             .publish_diagnostics(
                 params.text_document.uri,
@@ -189,7 +190,7 @@ impl LanguageServer for Backend {
             .await;
     }
 
-    async fn did_change(&self, params: tower_lsp::lsp_types::DidChangeTextDocumentParams) {
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
         self.client
             .publish_diagnostics(
                 params.text_document.uri,
